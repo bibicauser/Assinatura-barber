@@ -370,8 +370,9 @@
       <input type="text" id="pk-preco" placeholder="R$ 400,00" />
 
       <div class="qr-card">
-        <div class="qr"></div>
-        <p>QR code Pix gerado a partir da chave cadastrada no seu perfil</p>
+        <div id="qr-canvas" style="display:flex;justify-content:center;margin:0 auto 10px;"></div>
+        <p>QR code Pix gerado a partir do telefone cadastrado no seu perfil</p>
+        <button class="btn small" id="btn-copy-pix" style="margin-top:10px;">Copiar código Pix</button>
       </div>
 
       <button class="btn primary block" id="btn-save-pacote">Salvar e gerar cobrança</button>
@@ -410,8 +411,8 @@
       <input type="text" id="pf-nome" placeholder="Seu nome" />
       <label for="pf-prof">Profissão</label>
       <input type="text" id="pf-prof" placeholder="Ex: Cabeleireiro" />
-      <label for="pf-pix">Chave Pix para recebimento</label>
-      <input type="text" id="pf-pix" placeholder="email@exemplo.com" />
+      <label for="pf-pix">Telefone Pix (com DDD, sem +55)</label>
+      <input type="text" id="pf-pix" placeholder="11999999999" />
       <button class="btn primary block" id="btn-save-perfil" style="margin-top:18px;">Salvar</button>
       <button class="btn block" id="btn-logout" style="margin-top:10px;">Sair da conta</button>
     </section>
@@ -463,6 +464,7 @@
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
@@ -476,16 +478,109 @@
   var state = {
     clients: [],
     appts: [],
+    profile: {name:"", profession:"", pix_key:"", city:"SAO PAULO"},
     agendaOpen: true,
     agendaUntil: "18:00",
     currentClientId: null
   };
+
+  // ---- montagem do Pix Copia e Cola (BR Code) ----
+  function crc16(str){
+    var crc = 0xFFFF;
+    for(var i=0;i<str.length;i++){
+      crc ^= (str.charCodeAt(i) << 8);
+      for(var j=0;j<8;j++){
+        crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xFFFF : (crc << 1) & 0xFFFF;
+      }
+    }
+    return crc.toString(16).toUpperCase().padStart(4,"0");
+  }
+
+  function tlv(id, value){
+    var len = String(value.length).padStart(2,"0");
+    return id + len + value;
+  }
+
+  function sanitizeText(str, maxLen){
+    return (str || "")
+      .normalize("NFD").replace(/[\u0300-\u036f]/g,"")
+      .toUpperCase()
+      .replace(/[^A-Z0-9 ]/g," ")
+      .trim()
+      .slice(0, maxLen) || "NAO INFORMADO";
+  }
+
+  function phoneToPixKey(phone){
+    var digits = (phone || "").replace(/\D/g,"");
+    if(digits.length === 0) return "";
+    if(digits.indexOf("55") === 0 && digits.length > 11) return "+"+digits;
+    return "+55"+digits;
+  }
+
+  function buildPixPayload(pixKeyRaw, merchantName, city, amount){
+    var pixKey = phoneToPixKey(pixKeyRaw);
+    var merchantAccount = tlv("00","br.gov.bcb.pix") + tlv("01", pixKey);
+    var merchantAccountInfo = tlv("26", merchantAccount);
+    var additionalData = tlv("62", tlv("05","***"));
+    var amountStr = Number(amount || 0).toFixed(2);
+    var noCrc =
+      tlv("00","01") +
+      tlv("01","11") +
+      merchantAccountInfo +
+      tlv("52","0000") +
+      tlv("53","986") +
+      tlv("54", amountStr) +
+      tlv("58","BR") +
+      tlv("59", sanitizeText(merchantName, 25)) +
+      tlv("60", sanitizeText(city, 15)) +
+      additionalData +
+      "6304";
+    return noCrc + crc16(noCrc);
+  }
+
+  function renderPixQr(amount){
+    var box = document.getElementById("qr-canvas");
+    box.innerHTML = "";
+    if(!state.profile.pix_key){
+      box.innerHTML = '<p style="font-size:12px;color:var(--danger);">Cadastre seu telefone Pix no Perfil antes de gerar a cobrança.</p>';
+      return;
+    }
+    var payload = buildPixPayload(state.profile.pix_key, state.profile.name, state.profile.city, amount);
+    new QRCode(box, {text: payload, width:140, height:140});
+    document.getElementById("btn-copy-pix").setAttribute("data-payload", payload);
+  }
+
+  document.getElementById("btn-copy-pix").addEventListener("click", function(){
+    var payload = this.getAttribute("data-payload");
+    if(!payload) return;
+    navigator.clipboard.writeText(payload).then(function(){
+      var btn = document.getElementById("btn-copy-pix");
+      var original = btn.textContent;
+      btn.textContent = "Copiado!";
+      setTimeout(function(){ btn.textContent = original; }, 1200);
+    });
+  });
+
+  // ---- perfil ----
+  function loadProfile(){
+    return db.from("profiles").select("*").eq("user_id", currentUser.id).then(function(res){
+      if(res.error){ console.error(res.error); return; }
+      if(res.data && res.data.length){
+        var p = res.data[0];
+        state.profile = {name:p.name || "", profession:p.profession || "", pix_key:p.pix_key || "", city:p.city || "SAO PAULO"};
+      }
+      document.getElementById("pf-nome").value = state.profile.name;
+      document.getElementById("pf-prof").value = state.profile.profession;
+      document.getElementById("pf-pix").value = state.profile.pix_key;
+    });
+  }
 
   // ---- autenticação ----
   var authScreen = document.getElementById("auth-screen");
 
   function showApp(){
     authScreen.style.display = "none";
+    loadProfile();
     loadClients().then(function(){
       document.getElementById("pk-cliente").innerHTML = clientOptions();
     });
@@ -753,11 +848,10 @@
       c.used = 0;
       c.service = nome;
       c.history = newHistory;
-      document.getElementById("pk-nome").value = "";
-      document.getElementById("pk-qtd").value = "";
-      document.getElementById("pk-preco").value = "";
       renderClients();
-      openClient(c.id);
+      var precoRaw = document.getElementById("pk-preco").value;
+      var precoNum = parseFloat(precoRaw.replace(/[^\d,.-]/g,"").replace(",", "."));
+      renderPixQr(precoNum || 0);
     });
   });
 
@@ -832,8 +926,20 @@
   document.getElementById("btn-save-perfil").addEventListener("click", function(){
     var btn = document.getElementById("btn-save-perfil");
     var original = btn.textContent;
-    btn.textContent = "Salvo";
-    setTimeout(function(){ btn.textContent = original; }, 1200);
+    var payload = {
+      user_id: currentUser.id,
+      name: document.getElementById("pf-nome").value.trim(),
+      profession: document.getElementById("pf-prof").value.trim(),
+      pix_key: document.getElementById("pf-pix").value.trim()
+    };
+    db.from("profiles").upsert(payload, {onConflict:"user_id"}).then(function(res){
+      if(res.error){ alert("Erro ao salvar perfil: "+res.error.message); return; }
+      state.profile.name = payload.name;
+      state.profile.profession = payload.profession;
+      state.profile.pix_key = payload.pix_key;
+      btn.textContent = "Salvo";
+      setTimeout(function(){ btn.textContent = original; }, 1200);
+    });
   });
 
 })();
